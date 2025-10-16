@@ -211,6 +211,4 @@ class AsyncFlow:
                         )
                         return
 
-            await asyncio.sleep(0.1)
-
         logger.info("ПОТОК ЗАВЕРШЕН.")
