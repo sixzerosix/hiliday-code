@@ -10,7 +10,7 @@ class TradeInput(BaseModel):
     """Начальные данные для торговой операции."""
 
     ticker: str
-    amount: float  # Сумма в USD для покупки
+    amount_usd: float  # Сумма в USD для покупки
     max_slippage: float = 0.005  # Максимально допустимое проскальзывание
 
 
@@ -40,11 +40,48 @@ class ExecutionOutput(BaseModel):
 
 
 class NotificationInput(BaseModel):
-    """Входные данные для контракта уведомления."""
+    """Входные данные для контракта уведомления об исполнении."""
 
     order_id: str
     executed_price: float
     quantity_bought: float
+
+
+class NotificationStatusOutput(BaseModel):
+    """Выходные данные после отправки уведомления об исполнении."""
+
+    notification_status: str
+
+
+# --- НОВЫЕ СХЕМЫ ДЛЯ ДЕМОНСТРАЦИИ ---
+
+
+class VolumeCheckInput(BaseModel):
+    """Входные данные для контракта проверки объема."""
+
+    ticker: str  # Добавим ticker для контекста в логах
+    volume_24h: float
+
+
+class VolumeCheckOutput(BaseModel):
+    """Выходные данные после проверки объема."""
+
+    ticker: str
+    is_high_volume: bool
+
+
+class PriceAlertInput(BaseModel):
+    """Входные данные для контракта ценового уведомления."""
+
+    ticker: str
+    current_price: float
+
+
+class PriceAlertOutput(BaseModel):
+    """Выходные данные после отправки ценового уведомления."""
+
+    ticker: str
+    alert_sent: bool
 
 
 # --- Общие Схемы Задач (Task Flow) ---

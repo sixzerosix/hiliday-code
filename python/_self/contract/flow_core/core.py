@@ -1,11 +1,30 @@
-# flow_core.py
+# flow_core_project/flow_core/core.py
 
 import uuid
 import asyncio
-from typing import Any, Dict, List, Optional, Literal, Callable, Type
+import logging
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Literal,
+    Callable,
+    Type,
+    Awaitable,
+    Union,
+    Set,
+    get_args,
+)
+
 from pydantic import BaseModel, ValidationError
 
-Status = Literal["PENDING", "RUNNING", "COMPLETED", "FAILED"]
+# Импортируем функцию для создания статусов и базовые статусы
+from flow_core.models import create_flow_status_type, BASE_FLOW_STATUSES
+
+logger = logging.getLogger("flow_core.core")
+
+Status = BASE_FLOW_STATUSES
 
 
 class Contract:
@@ -16,7 +35,7 @@ class Contract:
         name: str,
         InputModel: Type[BaseModel],
         OutputModel: Type[BaseModel],
-        logic: Callable[..., Dict[str, Any]],
+        logic: Callable[..., Union[Dict[str, Any], Awaitable[Dict[str, Any]]]],
     ) -> None:
         self.id = uuid.uuid4()
         self.name = name
@@ -29,47 +48,43 @@ class Contract:
 
     def is_ready(self) -> bool:
         """Проверяет, собрано ли достаточно данных для попытки валидации входной схемы."""
-        # Проверяем, что собрано ключей больше или равно необходимому для InputModel
         return self.status == "PENDING" and len(self.required_inputs) >= len(
             self.InputModel.model_fields
         )
 
     async def execute(self) -> None:
         """Асинхронно выполняет логику контракта с валидацией Pydantic."""
-        if not self.is_ready():
+        if self.status != "PENDING":
             return
 
         self.status = "RUNNING"
-        print(f"🟡 [CORE] Контракт '{self.name}' запущен (RUNNING)...")
+        logger.info(f"Контракт '{self.name}' запущен (RUNNING)...")
 
         try:
-            # 1. ВАЛИДАЦИЯ ВХОДНЫХ ДАННЫХ Pydantic
             validated_inputs = self.InputModel(**self.required_inputs)
             input_data_for_logic = validated_inputs.model_dump()
 
-            # 2. Выполнение логики
             if asyncio.iscoroutinefunction(self.logic):
                 result = await self.logic(**input_data_for_logic)
             else:
                 result = await asyncio.to_thread(self.logic, **input_data_for_logic)
 
-            # 3. ВАЛИДАЦИЯ ВЫХОДНЫХ ДАННЫХ Pydantic
             validated_output = self.OutputModel(**result)
             self.data = validated_output.model_dump()
 
             self.status = "COMPLETED"
-            print(f"✅ [CORE] Контракт '{self.name}' завершен. Результат: {self.data}")
+            logger.info(f"Контракт '{self.name}' завершен. Результат: {self.data}")
 
         except ValidationError as e:
             self.status = "FAILED"
-            print(
-                f"❌ [CORE] Контракт '{self.name}' провалился из-за ошибки валидации: {e.errors()}"
+            logger.error(
+                f"Контракт '{self.name}' провалился из-за ошибки валидации: {e.errors()}"
             )
             self.data = {}
         except Exception as e:
             self.status = "FAILED"
-            print(
-                f"❌ [CORE] Контракт '{self.name}' провалился из-за внутренней ошибки: {e}"
+            logger.exception(
+                f"Контракт '{self.name}' провалился из-за внутренней ошибки."
             )
             self.data = {}
 
@@ -92,11 +107,19 @@ class AsyncFlow:
     """Управляет асинхронным порядком выполнения и потоком данных."""
 
     def __init__(
-        self, contracts: List[Contract], dependencies: List[Dependency]
+        self,
+        contracts: List[Contract],
+        dependencies: List[Dependency],
+        additional_flow_statuses: Optional[Set[str]] = None,
     ) -> None:
         self.contracts = contracts
         self.dependencies = dependencies
         self.running_tasks: List[asyncio.Task] = []
+        self.task_contract_map: Dict[asyncio.Task, Contract] = {}
+
+        self.FlowStatus = create_flow_status_type(additional_flow_statuses)
+        self._all_valid_statuses = set(get_args(self.FlowStatus))
+        self._base_flow_statuses = set(get_args(BASE_FLOW_STATUSES))
 
     def _initialize_contracts(self, initial_data: Dict[str, Any]) -> None:
         """Инициализирует контракты начальными данными."""
@@ -104,31 +127,32 @@ class AsyncFlow:
             for key in contract.InputModel.model_fields.keys():
                 if key in initial_data:
                     contract.required_inputs[key] = initial_data[key]
-        print("🚀 [CORE] Инициализация Потока завершена.")
-
-    # Фрагмент кода, который нужно изменить в flow_core.py
+        logger.info("Инициализация Потока завершена.")
 
     def _distribute_data(self, completed_contract: Contract) -> None:
         """Распределяет выходные данные завершенного контракта по зависимым."""
         for dep in self.dependencies:
             if dep.source == completed_contract:
                 target = dep.target
-                if target.status == "PENDING":
+                # Разрешаем передачу данных, если целевой контракт находится в PENDING
+                # или в одном из дополнительных статусов, но не RUNNING/COMPLETED/FAILED
+                if target.status == "PENDING" or (
+                    target.status not in self._base_flow_statuses
+                    and target.status != "RUNNING"
+                    and target.status != "COMPLETED"
+                    and target.status != "FAILED"
+                ):
 
-                    # --- НОВАЯ ЛОГИКА АВТОМАТИЧЕСКОГО МЭППИНГА ---
                     if "*" in dep.mapping and dep.mapping["*"] == "*":
-                        # Если указан маркер "*: *", автоматически передаем совпадающие ключи
                         target_input_keys = target.InputModel.model_fields.keys()
                         for src_key, src_value in completed_contract.data.items():
                             if src_key in target_input_keys:
                                 target.required_inputs[src_key] = src_value
-                                print(
-                                    f"      [AUTO-MAP] {completed_contract.name}:{src_key} -> {target.name}:{src_key}"
+                                logger.debug(
+                                    f"[AUTO-MAP] {completed_contract.name}:{src_key} -> {target.name}:{src_key}"
                                 )
-                        continue  # Пропускаем стандартный маппинг для этой зависимости
-                    # -----------------------------------------------
+                        continue
 
-                    # Стандартный маппинг
                     for src_key, target_key in dep.mapping.items():
                         if src_key in completed_contract.data:
                             target.required_inputs[target_key] = (
@@ -140,7 +164,8 @@ class AsyncFlow:
 
         self._initialize_contracts(initial_data or {})
 
-        while any(c.status in ["PENDING", "RUNNING"] for c in self.contracts):
+        # ИСПРАВЛЕНО: Условие цикла. Продолжаем, пока есть хотя бы один незавершенный контракт.
+        while any(c.status not in ["COMPLETED", "FAILED"] for c in self.contracts):
 
             ready_contracts = [c for c in self.contracts if c.is_ready()]
             newly_started_count = 0
@@ -148,20 +173,26 @@ class AsyncFlow:
             for contract in ready_contracts:
                 task = asyncio.create_task(contract.execute())
                 self.running_tasks.append(task)
+                self.task_contract_map[task] = contract
                 newly_started_count += 1
 
-            if ready_contracts:
-                print(
-                    f"\n💡 [CORE] Найдено и запущено {newly_started_count} новых контрактов."
+            if newly_started_count > 0:
+                logger.info(
+                    f"Найдено и запущено {newly_started_count} новых контрактов."
                 )
 
-            if not self.running_tasks and any(
+            # ИСПРАВЛЕНО: Детектор тупиковой ситуации
+            # Тупик, если нет активных задач И нет контрактов в PENDING,
+            # но при этом есть контракты, которые еще не COMPLETED/FAILED.
+            if not self.running_tasks and not any(
                 c.status == "PENDING" for c in self.contracts
             ):
-                print(
-                    "\n🛑 [CORE] Тупиковая ситуация: Нет готовых к выполнению контрактов, и нет запущенных задач."
-                )
-                break
+                if any(c.status not in ["COMPLETED", "FAILED"] for c in self.contracts):
+                    logger.warning(
+                        "Тупиковая ситуация: Нет запущенных контрактов, нет готовых к выполнению (PENDING), "
+                        "но есть незавершенные контракты. Поток остановлен."
+                    )
+                    break
 
             if self.running_tasks:
                 done, pending = await asyncio.wait(
@@ -170,23 +201,16 @@ class AsyncFlow:
                 self.running_tasks = list(pending)
 
                 for task in done:
-                    completed_contract = next(
-                        (
-                            c
-                            for c in self.contracts
-                            if c.status in ["COMPLETED", "FAILED"]
-                        ),
-                        None,
-                    )
+                    completed_contract = self.task_contract_map.pop(task)
 
-                    if completed_contract and completed_contract.status == "COMPLETED":
+                    if completed_contract.status == "COMPLETED":
                         self._distribute_data(completed_contract)
-                    elif completed_contract and completed_contract.status == "FAILED":
-                        print(
-                            f"--- [CORE] Процесс остановлен из-за ошибки в контракте '{completed_contract.name}' ---"
+                    elif completed_contract.status == "FAILED":
+                        logger.error(
+                            f"Процесс остановлен из-за ошибки в контракте '{completed_contract.name}'."
                         )
                         return
 
             await asyncio.sleep(0.1)
 
-        print("\n--- [CORE] ПОТОК ЗАВЕРШЕН ---")
+        logger.info("ПОТОК ЗАВЕРШЕН.")
